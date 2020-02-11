@@ -53,6 +53,8 @@ from ..utils import bounding_box
 MSEC_IN_SEC = 1000
 MAX_SELF_CONSISTENT_ITERS = 32
 
+# JG: set the logging level to debug (TODO: remove this after debugging)
+logging.basicConfig(level=logging.DEBUG)
 
 # Visualization.
 # ---------------------------------------------------------------------------
@@ -195,7 +197,9 @@ class Canvas(object):
                keep_history=False,
                checkpoint_path=None,
                checkpoint_interval_sec=0,
-               corner_zyx=None):
+               corner_zyx=None,
+               reset_seed_per_segment=True,
+               allow_overlapping_segmentation=False):
     """Initializes the canvas.
 
     Args:
@@ -219,11 +223,14 @@ class Canvas(object):
           seconds); if <= 0, no checkpoint are going to be saved
       corner_zyx: 3 element array-like indicating the spatial corner of the
           image in (z, y, x)
+      allow_overlapping_segmentation: if True, inference will be allowed to proceed to
+      positions even if they were already contained in a previous segmentation run.
     """
     self.model = model
     self.image = image
     self.executor = tf_executor
     self._exec_client_id = None
+    self.allow_overlapping_segment = allow_overlapping_segmentation
 
     self.options = inference_pb2.InferenceOptions()
     self.options.CopyFrom(options)
@@ -262,7 +269,12 @@ class Canvas(object):
     # in logit form, and is fed directly as the mask input to the FFN
     # model.
     self.seed = np.zeros(self.shape, dtype=np.float32)
+
+    # JG: self.segmentation is an array of shape self.shape where a pixel is zero if the
+    # location has not been segmented yet, and otherwise contains the integer id of
+    # that segment.
     self.segmentation = np.zeros(self.shape, dtype=np.int32)
+
     self.seg_prob = np.zeros(self.shape, dtype=np.uint8)
 
     # When an initial segmentation is provided, maps the global ID space
@@ -280,7 +292,7 @@ class Canvas(object):
     self.overlaps = {}  # (ids, number overlapping voxels)
 
     # Whether to always create a new seed in segment_at.
-    self.reset_seed_per_segment = True
+    self.reset_seed_per_segment = reset_seed_per_segment
 
     if movement_policy_fn is None:
       # The model.deltas are (for now) in xyz order and must be swapped to zyx.
@@ -337,11 +349,10 @@ class Canvas(object):
     Returns:
       Boolean indicating whether to run FFN inference at the given position.
     """
-
     if not ignore_move_threshold:
       if self.seed[pos] < self.options.move_threshold:
         self.counters['skip_threshold'].Increment()
-        logging.debug('.. seed value below threshold.')
+        logging.info('.. seed value below threshold.')
         return False
 
     # Not enough image context?
@@ -351,14 +362,18 @@ class Canvas(object):
 
     if np.any(low < 0) or np.any(high >= self.shape):
       self.counters['skip_invalid_pos'].Increment()
-      logging.debug('.. too close to border: %r', pos)
+      logging.info('.. too close to border: %r', pos)
       return False
 
     # Location already segmented?
+
     if self.segmentation[pos] > 0:
-      self.counters['skip_invalid_pos'].Increment()
-      logging.debug('.. segmentation already active: %r', pos)
-      return False
+      if self.allow_overlapping_segment:
+        logging.info("allowing overlapping segmentation at pos {}".format(pos))
+      else:
+        self.counters['skip_invalid_pos'].Increment()
+        logging.info('.. segmentation already active: %r', pos)
+        return False
 
     return True
 
@@ -452,7 +467,7 @@ class Canvas(object):
       if self.options.disco_seed_threshold >= 0:
         th_max = logit(0.5)
         old_seed = self.seed[sel]
-
+        # TODO(jpgard): why are logits containing null values?
         if self._keep_history:
           self.history_deleted.append(
               np.sum((old_seed >= logit(0.8)) & (logits < th_max)))
@@ -546,6 +561,15 @@ class Canvas(object):
 
           self._maybe_save_checkpoint()
 
+        if not self.movement_policy.any_valid_coords_in_queue():
+          # We have reached the end of this tracing iteration; pull more seeds.
+          try:
+            self.log_info("refreshing seeds.")
+            self.seed_policy.refresh_seeds()
+          # If this method is not implemented for the seed policy, skip it.
+          except Exception as e:
+            pass
+
     return num_iters
 
   def log_info(self, string, *args, **kwargs):
@@ -562,21 +586,29 @@ class Canvas(object):
       seed_policy: callable taking the image and the canvas object as arguments
           and returning an iterator over proposed seed point.
     """
+
     self.seed_policy = seed_policy(self)
     if self._seed_policy_state is not None:
       self.seed_policy.set_state(self._seed_policy_state)
       self._seed_policy_state = None
+
+    self.log_info("[JG] seed_policy is {}".format(self.seed_policy))
+    self.log_info("[JG] movement_policy is {}".format(self.movement_policy))
 
     with timer_counter(self.counters, 'segment_all'):
       mbd = self.options.min_boundary_dist
       mbd = np.array([mbd.z, mbd.y, mbd.x])
 
       for pos in TimedIter(self.seed_policy, self.counters, 'seed-policy'):
+
+        self.log_info("[JG] segment_all() processing pos {}".format(pos))
+
         # When starting a new segment the move_threshold on the probability
         # should be ignored when determining if the position is valid.
         if not (self.is_valid_pos(pos, ignore_move_threshold=True)
-                and self.restrictor.is_valid_pos(pos)
-                and self.restrictor.is_valid_seed(pos)):
+              and self.restrictor.is_valid_pos(pos)
+              and self.restrictor.is_valid_seed(pos)):
+          logging.info("pos {} is not valid; continuing".format(pos))
           continue
 
         self._maybe_save_checkpoint()
@@ -624,7 +656,12 @@ class Canvas(object):
         # We only allow creation of new segments in areas that are currently
         # empty.
         mask = self.seed[sel] >= self.options.segment_threshold
+
         raw_segmented_voxels = np.sum(mask)
+
+        # Smell-test to ensure mask does not include all True values; this helps ensure
+        # RunTimeWarning is just a warning, not due to a data issue.
+        assert not np.all(mask), "invalid mask, potentially due to invalid seed array"
 
         # Record existing segment IDs overlapped by the newly added object.
         overlapped_ids, counts = np.unique(self.segmentation[sel][mask],
@@ -1119,6 +1156,21 @@ class Runner(object):
       kwargs.update(json.loads(self.request.seed_policy_args))
     return functools.partial(policy_cls, **kwargs)
 
+  def save_histories(self, dirname, canvas):
+    """Save the seed_history, skel_history, and coords from the canvas SeedPolicy."""
+    # TODO(jpgard): potentially implement this as a method of the policy, not here.
+    coords = canvas.seed_policy.coords
+    skel_history = canvas.seed_policy.skeleton_history
+    seed_history = canvas.seed_policy.seed_history
+    outfile = os.path.join(dirname, "history")
+    logging.info("writing history to {}".format(outfile))
+    np.savez_compressed(outfile,
+                        coords=coords,
+                        skel_history=skel_history,
+                        seed_history=seed_history
+                        )
+    return
+
   def save_segmentation(self, canvas, alignment, target_path, prob_path):
     """Saves segmentation to a file.
 
@@ -1168,7 +1220,7 @@ class Runner(object):
     with storage.atomic_file(prob_path) as fd:
       np.savez_compressed(fd, qprob=prob)
 
-  def run(self, corner, subvol_size, reset_counters=True):
+  def run(self, corner, subvol_size, reset_counters=True, **canvas_kwargs):
     """Runs FFN inference over a subvolume.
 
     Args:
@@ -1180,6 +1232,7 @@ class Runner(object):
       Canvas object with the segmentation or None if the canvas could not
       be created or the segmentation subvolume already exists.
     """
+
     if reset_counters:
       self.counters.reset()
 
@@ -1193,7 +1246,7 @@ class Runner(object):
     if gfile.Exists(seg_path):
       return None
 
-    canvas, alignment = self.make_canvas(corner, subvol_size)
+    canvas, alignment = self.make_canvas(corner, subvol_size, **canvas_kwargs)
     if canvas is None:
       return None
 
@@ -1208,6 +1261,7 @@ class Runner(object):
 
     canvas.segment_all(seed_policy=self.get_seed_policy(corner, subvol_size))
     self.save_segmentation(canvas, alignment, seg_path, prob_path)
+    self.save_histories(self.request.segmentation_output_dir, canvas)
 
     # Attempt to remove the checkpoint file now that we no longer need it.
     try:

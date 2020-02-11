@@ -29,6 +29,10 @@ import numpy as np
 from scipy import ndimage
 import skimage
 import skimage.feature
+from skimage import morphology
+import networkx as nx
+from scipy.special import expit
+from skan import skeleton_to_csgraph
 
 from . import storage
 
@@ -288,11 +292,40 @@ class PolicyInvertOrigins(BaseSeedPolicy):
                             in points])
 
 
-class ManualSeedPolicy(BaseSeedPolicy):
+class SeedPolicyWithSaver(BaseSeedPolicy):
+    """A seed policy which also optionally saves the seed at specified intervals."""
+    def __init__(self, canvas, save_history_every=None, **kwargs):
+        super(SeedPolicyWithSaver, self).__init__(canvas, **kwargs)
+        self.save_history_every = save_history_every
+        # Seed history is an ndarray of shape [z, y, x, iter_num].
+        self.seed_history = np.expand_dims(np.zeros_like(self.canvas.image), -1)
+        self.coord_history = None
+        self.seg_prob_history = np.expand_dims(np.zeros_like(self.canvas.image), -1)
+
+    def save_seed_history(self):
+        self.seed_history = np.concatenate((self.seed_history,
+                                            np.expand_dims(self.canvas.seed, -1)),
+                                           axis=-1)
+
+    def save_seg_prob_history(self):
+        self.seg_prob_history = np.concatenate((self.seg_prob_history,
+                                            np.expand_dims(self.canvas.seg_prob, -1)),
+                                           axis=-1)
+
+
+    def _check_save_history(self):
+        """Check whether seeds should be saved at this iteration; if so, save them."""
+        if not self.save_history_every:
+            return
+        if self.idx % self.save_history_every == 0:
+            self.save_seed_history()
+
+
+class ManualSeedPolicy(SeedPolicyWithSaver):
     """Use a manually-specified set of seeds."""
-    def __init__(self, canvas, **kwargs):
+    def __init__(self, canvas, save_history_every=None):
       logging.info("ManualSeedPolicy.__init__()")
-      super(ManualSeedPolicy, self).__init__(canvas, **kwargs)
+      super(ManualSeedPolicy, self).__init__(canvas, save_history_every, **kwargs)
 
     def _init_coords(self):
         # TODO(jpgard): collect these from user; temporarily these are hard-coded.
@@ -330,9 +363,6 @@ class ManualSeedPolicy(BaseSeedPolicy):
     def __next__(self):
         """Returns the next seed point as (z, y, x).
 
-        Does initial filtering of seed points to exclude locations that are
-        too close to the image border.
-
         Returns:
           (z, y, x) tuples.
 
@@ -343,9 +373,117 @@ class ManualSeedPolicy(BaseSeedPolicy):
             self._init_coords()
 
         while self.idx < self.coords.shape[0]:
+            self._check_save_history()
             curr = self.coords[self.idx, :]
             self.idx += 1
             logging.info("ManualSeedPolicy processing seed: {}".format(curr))
             return tuple(curr)  # z, y, x
+
+        raise StopIteration()
+
+class TipTracerSeedPolicy(SeedPolicyWithSaver):
+
+    def __init__(self, canvas, save_history_every=1, skeletonization_threshold=0.25,
+                 **kwargs):
+        """
+        At each iteration, add the tips of the trace to the list of seeds.
+
+        :param canvas: Canvas object
+        each step (this is used to threshold the predicted probabilities in canvas).
+        :param save_seeds_every: save canvas at this interval; this consumes a lot of
+        memory for large arrays but is useful for debugging and visualization of
+        inference results. Note that the results are only written to disk after
+        completion of the Runner.run(), not after each iteration.
+        :param kwargs: other kwargs passed to BaseSeedPolicy constructor.
+        """
+
+        super(TipTracerSeedPolicy, self).__init__(
+            canvas, save_history_every=save_history_every, **kwargs)
+        self.skeletonization_threshold = skeletonization_threshold
+        self.skeleton_history = np.expand_dims(np.zeros_like(self.canvas.image), -1)
+
+    def _init_coords(self):
+        """Initialize array of seed coordinates in (z, y, x) format."""
+        coords = [(0, 4521, 3817, 0),  # soma center
+                  ]
+        self.coords = np.array(coords)
+
+    def _check_save_skeleton(self, skel):
+        """Check whether skeleton should be saved, and save it."""
+        if not self.save_history_every:
+            return
+        if self.idx % self.save_history_every == 0:
+            # save the skeleton
+            if len(skel.shape) == 2:
+                # skel is a 2D array; need to add a z-axis
+                skel_exp = np.expand_dims(skel, 0)
+            skel_exp = np.expand_dims(skel_exp, -1)
+            self.skeleton_history = np.concatenate(
+                (
+                    self.skeleton_history,
+                    skel_exp),
+                axis=-1
+            )
+
+    def refresh_seeds(self, n_trees=1) -> np.ndarray:
+        """Fetch a new set of tip seeds from the current canvas."""
+        new_seeds = list()
+        logging.info("TipTracerSeedPolicy skeletonizing and extracting seeds")
+        # Transform logits to probabilities, apply threshold, and skeletonize to
+        # extract the locations of leaf nodes ("tips")
+        c_t = expit(np.squeeze(self.canvas.seed))
+        c_t = np.nan_to_num(c_t)
+        c_t = (c_t >= self.skeletonization_threshold).astype(np.uint8)
+        s_t = morphology.skeletonize(c_t)
+        self._check_save_skeleton(s_t)
+        g_t, c_t, _ = skeleton_to_csgraph(s_t)
+        g_t = nx.from_scipy_sparse_matrix(g_t)
+        # Get connected components and extract leaf nodes, sorting from large to small.
+        subgraphs = sorted(nx.connected_components(g_t), key=len, reverse=True)
+        for subgraph_nodes in subgraphs[:n_trees]:
+
+            leaf_node_ids = [node_id for node_id, node_degree
+                             in g_t.degree(subgraph_nodes)
+                             if node_degree == 1
+                             ]
+            # Produce a nested list of [y, x] coordinates of leaf nodes in this subgraph.
+            leaf_node_yx = c_t[leaf_node_ids, :].astype(int).tolist()
+            new_seeds.extend(leaf_node_yx)
+
+        # Add z-coordinate to new_seeds and append to list of seed coords.
+        new_seeds = np.hstack((np.zeros((len(new_seeds), 1), dtype=int),
+                               new_seeds,
+                               np.full((len(new_seeds), 1), self.idx, dtype=int)))
+
+        # Compute the unique union of existing coords and new seeds (do not re-seed in
+        # locations which have already been seeded.
+
+        coord_update = np.vstack((self.coords, new_seeds))
+        coord_update = np.unique(coord_update, axis=0)
+        coord_update = coord_update[np.argsort(coord_update[:, 3])]
+        self.coords = coord_update
+
+
+    def __next__(self):
+        """Update the list of seeds and return the next seed point as (z, y, x).
+
+        Applies skeletonization to the existing canvas, extracts leaf nodes of the
+        current skeleton, and adds the coordinates of leaf nodes to the list of seeds.
+
+        Returns:
+          (z, y, x) tuples.
+
+        Raises:
+          StopIteration when the seeds are exhausted.
+        """
+        if self.coords is None:
+            self._init_coords()
+
+        self._check_save_history()
+
+        while self.idx < self.coords.shape[0]:
+            curr = self.coords[self.idx, :3]
+            self.idx += 1
+            return tuple(curr)
 
         raise StopIteration()
